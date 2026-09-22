@@ -609,6 +609,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self.setup_prompts()
 
         self.init_ui_functionality()
+        self.init_editable_area_functionality()
 
         self._active_source_volume_id = self._volume_node_id(self.get_volume_node())
 
@@ -2517,7 +2518,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             )
         )
         t1 = time.time()
-        self.apply_result(changed_bbox)
+        self.apply_result(changed_bbox, positive_click=positive_click)
         debug_print(
             f"[timing] add_point_interaction {t1 - t0:.3f}s | apply_result {time.time() - t1:.3f}s"
         )
@@ -2750,7 +2751,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         # started), so there is no lingering marker to remove; push a no-op to keep the
         # undo stack aligned with the session's interaction count.
         self._push_prompt_undo(lambda: None)
-        self.apply_result(changed_bbox)
+        self.apply_result(changed_bbox, positive_click=positive_click)
 
     #
     #  -- Lasso
@@ -3296,7 +3297,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 interaction_bbox=interaction_bbox,
             )
         )
-        self.apply_result(changed_bbox)
+        self.apply_result(changed_bbox, positive_click=positive_click)
         return True
 
     def _same_mrml_node(self, a, b):
@@ -3732,7 +3733,9 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 return
         except Exception as exc:  # noqa: BLE001
             debug_print(f"In-place segment clear failed ({exc}); using full write.")
-        self.show_segmentation(np.zeros(self.get_image_data().shape, dtype=np.uint8))
+        self.show_segmentation(
+            np.zeros(self.get_image_data().shape, dtype=np.uint8), restrict=False
+        )
 
     def on_delete_segment(self):
         """
@@ -3883,7 +3886,488 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         )
         return True
 
-    def show_segmentation(self, segmentation_mask, changed_bbox=None):
+    ###############################################################################
+    # Editable Area
+    ###############################################################################
+    #
+    # Restricts which voxels a prediction may change in the current segment:
+    #   - "Everywhere"       : no restriction (original behaviour, zero overhead).
+    #   - "Inside segments"  : only voxels covered by any OTHER segment.
+    #   - "Outside segments" : only voxels NOT covered by any other segment.
+    #   - "Specific segment" : only voxels covered by one chosen segment.
+    # Voxels outside the editable area keep their CURRENT state (they are frozen,
+    # not cleared).
+    #
+    # The prediction arrives as the session's live target buffer, so it is never
+    # modified in place. The restriction is computed only inside the prediction's
+    # changed bbox, using the zero-copy internal-labelmap views, so the fast
+    # region-limited write path stays fast.
+
+    _EDITABLE_AREA_MODES = {
+        "Everywhere": "everywhere",
+        "Inside segments": "inside",
+        "Outside segments": "outside",
+        "Specific segment": "specific",
+    }
+
+    def init_editable_area_functionality(self):
+        """Wire up the Editable Area controls."""
+        self.ui.cmbEditableArea.currentIndexChanged.connect(
+            self.on_editable_area_mode_changed
+        )
+        self.ui.chkEdgeBand.toggled.connect(self.ui.spinEdgeBandRadius.setEnabled)
+        self.ui.spinEdgeBandRadius.setEnabled(self.ui.chkEdgeBand.checked)
+
+        self.ui.chkIntensityRange.toggled.connect(self.on_intensity_range_toggled)
+        self.ui.pbIntensityRangeReset.clicked.connect(self.reset_intensity_range_to_volume)
+        self.on_intensity_range_toggled(self.ui.chkIntensityRange.checked)
+        # Keep the "specific segment" list current as the user switches segments
+        # (the active segment is excluded from that list).
+        try:
+            self.ui.editor_widget.currentSegmentIDChanged.connect(
+                lambda *_: self.refresh_editable_area_segment_combo()
+            )
+        except Exception as exc:  # noqa: BLE001 - signal name differs across versions
+            debug_print(f"Editable area: could not observe segment changes ({exc})")
+
+        self.on_editable_area_mode_changed()
+
+    def get_editable_area_mode(self):
+        return self._EDITABLE_AREA_MODES.get(
+            self.ui.cmbEditableArea.currentText, "everywhere"
+        )
+
+    def on_editable_area_mode_changed(self, *_):
+        is_specific = self.get_editable_area_mode() == "specific"
+        self.ui.lblEditableAreaSegment.setVisible(is_specific)
+        self.ui.cmbEditableAreaSegment.setVisible(is_specific)
+        if is_specific:
+            self.refresh_editable_area_segment_combo()
+        debug_print(f"Editable area mode: {self.get_editable_area_mode()}")
+
+    def refresh_editable_area_segment_combo(self):
+        """
+        Repopulate the "specific segment" list with every segment except the
+        active one, preserving the previous choice where possible.
+        """
+        combo = self.ui.cmbEditableAreaSegment
+        previous_id = combo.itemData(combo.currentIndex) if combo.currentIndex >= 0 else None
+
+        combo.blockSignals(True)
+        try:
+            combo.clear()
+            segmentation_node = self.ui.editor_widget.segmentationNode()
+            if segmentation_node is None:
+                combo.addItem("(no segmentation)", None)
+                combo.setEnabled(False)
+                return
+
+            segmentation = segmentation_node.GetSegmentation()
+            current_id = self.get_current_segment_id()
+            selected_index = 0
+            n = 0
+            for idx in range(segmentation.GetNumberOfSegments()):
+                segment_id = segmentation.GetNthSegmentID(idx)
+                if segment_id == current_id:
+                    continue
+                combo.addItem(segmentation.GetSegment(segment_id).GetName(), segment_id)
+                if segment_id == previous_id:
+                    selected_index = n
+                n += 1
+
+            if n == 0:
+                combo.addItem("(no other segments)", None)
+                combo.setEnabled(False)
+            else:
+                combo.setEnabled(True)
+                combo.setCurrentIndex(selected_index)
+        finally:
+            combo.blockSignals(False)
+
+    def _labelmap_matches_volume_geometry(self, vimage):
+        """
+        True if the internal labelmap shares the source volume's voxel grid, so
+        its IJK indices line up with the target buffer (the same assumption the
+        module's region-limited write path makes).
+        """
+        volume_node = self.get_volume_node()
+        if volume_node is None:
+            return False
+        labelmap_to_world = vtk.vtkMatrix4x4()
+        vimage.GetImageToWorldMatrix(labelmap_to_world)
+        ijk_to_ras = vtk.vtkMatrix4x4()
+        volume_node.GetIJKToRASMatrix(ijk_to_ras)
+        for r in range(4):
+            for c in range(4):
+                if abs(labelmap_to_world.GetElement(r, c) - ijk_to_ras.GetElement(r, c)) > 1e-4:
+                    return False
+        return True
+
+    def _segment_mask_in_region(self, segmentation_node, segment_id, region):
+        """
+        Boolean mask of `segment_id` inside `region` ((k0,k1),(j0,j1),(i0,i1),
+        half-open, in target-buffer (k, j, i) order).
+
+        Reads the zero-copy internal labelmap and compares against THIS segment's
+        label value (labelmaps can be shared between segments). Falls back to the
+        full resampled extraction if the labelmap grid differs from the volume.
+        """
+        (k0, k1), (j0, j1), (i0, i1) = region
+        out = np.zeros((k1 - k0, j1 - j0, i1 - i0), dtype=bool)
+
+        segment = segmentation_node.GetSegmentation().GetSegment(segment_id)
+        if segment is None:
+            return out
+        vimage = segmentation_node.GetBinaryLabelmapInternalRepresentation(segment_id)
+        if vimage is None:
+            return out
+
+        if not self._labelmap_matches_volume_geometry(vimage):
+            full = slicer.util.arrayFromSegmentBinaryLabelmap(
+                segmentation_node, segment_id, self.get_volume_node()
+            )
+            if full is None:
+                return out
+            return full[k0:k1, j0:j1, i0:i1] != 0
+
+        ix0, ix1, iy0, iy1, iz0, iz1 = vimage.GetExtent()
+        if ix1 < ix0 or iy1 < iy0 or iz1 < iz0:
+            return out  # nothing allocated
+
+        # Intersection of the requested region with the allocated extent
+        ka, kb = max(k0, iz0), min(k1, iz1 + 1)
+        ja, jb = max(j0, iy0), min(j1, iy1 + 1)
+        ia, ib = max(i0, ix0), min(i1, ix1 + 1)
+        if ka >= kb or ja >= jb or ia >= ib:
+            return out
+
+        view = slicer.util.arrayFromSegmentInternalBinaryLabelmap(segmentation_node, segment_id)
+        if view is None or view.size == 0:
+            return out
+        out[ka - k0:kb - k0, ja - j0:jb - j0, ia - i0:ib - i0] = (
+            view[ka - iz0:kb - iz0, ja - iy0:jb - iy0, ia - ix0:ib - ix0]
+            == segment.GetLabelValue()
+        )
+        return out
+
+    def _other_segments_union_in_region(self, segmentation_node, exclude_id, region):
+        (k0, k1), (j0, j1), (i0, i1) = region
+        union = np.zeros((k1 - k0, j1 - j0, i1 - i0), dtype=bool)
+        segmentation = segmentation_node.GetSegmentation()
+        for idx in range(segmentation.GetNumberOfSegments()):
+            segment_id = segmentation.GetNthSegmentID(idx)
+            if segment_id == exclude_id:
+                continue
+            union |= self._segment_mask_in_region(segmentation_node, segment_id, region)
+        return union
+
+    def _editable_area_constraint_in_region(self, segmentation_node, current_id, region):
+        """
+        Boolean "may edit" mask for `region`, or None when there is no
+        restriction (Everywhere, or Specific with nothing chosen).
+        """
+        mode = self.get_editable_area_mode()
+        if mode == "everywhere":
+            return None
+        if mode == "inside":
+            return self._other_segments_union_in_region(segmentation_node, current_id, region)
+        if mode == "outside":
+            return ~self._other_segments_union_in_region(segmentation_node, current_id, region)
+        if mode == "specific":
+            self.refresh_editable_area_segment_combo()
+            combo = self.ui.cmbEditableAreaSegment
+            specific_id = combo.itemData(combo.currentIndex) if combo.currentIndex >= 0 else None
+            if not specific_id:
+                debug_print("Editable area: no specific segment chosen; not restricting.")
+                return None
+            return self._segment_mask_in_region(segmentation_node, specific_id, region)
+        return None
+
+    def on_intensity_range_toggled(self, checked):
+        self.ui.intensityRangeSlider.setEnabled(bool(checked))
+        self.ui.pbIntensityRangeReset.setEnabled(bool(checked))
+        if checked:
+            self._ensure_intensity_range_for_volume()
+
+    def reset_intensity_range_to_volume(self):
+        """Set the slider's bounds and values to the current volume's full range."""
+        volume_node = self.get_volume_node()
+        if volume_node is None:
+            return
+        arr = slicer.util.arrayFromVolume(volume_node)
+        vmin, vmax = float(arr.min()), float(arr.max())
+        data_range = vmax - vmin
+
+        slider = self.ui.intensityRangeSlider
+        # Enough precision for normalised (0..1) images as well as raw MRI/CT values.
+        slider.decimals = 1 if data_range >= 100 else 3
+        slider.singleStep = data_range / 1000.0 if data_range > 0 else 1.0
+        slider.setRange(vmin, vmax)
+        slider.setValues(vmin, vmax)
+        self._intensity_range_volume_id = volume_node.GetID()
+        debug_print(f"Intensity range reset to [{vmin}, {vmax}] for {volume_node.GetName()}")
+
+    def _ensure_intensity_range_for_volume(self):
+        """Re-initialise the slider when the source volume has changed."""
+        volume_node = self.get_volume_node()
+        if volume_node is None:
+            return
+        if getattr(self, "_intensity_range_volume_id", None) != volume_node.GetID():
+            self.reset_intensity_range_to_volume()
+
+    def _intensity_constraint_in_region(self, region, shape):
+        """
+        Boolean mask (shaped like `region`) of voxels whose intensity lies within
+        the slider range, or None if the range covers the whole volume. Reads
+        the volume through a zero-copy view, sliced to the region only.
+        """
+        self._ensure_intensity_range_for_volume()
+        slider = self.ui.intensityRangeSlider
+        low, high = slider.minimumValue, slider.maximumValue
+        if low <= slider.minimum and high >= slider.maximum:
+            return None  # full range selected: no restriction
+
+        arr = slicer.util.arrayFromVolume(self.get_volume_node())
+        if arr.shape != tuple(shape):
+            # Refuse rather than guess: show_segmentation then skips applying the
+            # prediction instead of writing it unrestricted.
+            raise ValueError(
+                f"volume shape {arr.shape} does not match segmentation grid {tuple(shape)}"
+            )
+        (k0, k1), (j0, j1), (i0, i1) = region
+        sub = arr[k0:k1, j0:j1, i0:i1]
+        return (sub >= low) & (sub <= high)
+
+    def _edge_band_in_region(self, segmentation_node, current_id, region, shape):
+        """
+        Boolean mask (shaped like `region`) of voxels within the configured radius
+        (mm) of the current segment's boundary, inward and outward. Uses the
+        segment's state BEFORE this prompt, matching the original method: an
+        absolute SimpleITK signed Maurer distance map with image spacing.
+
+        Only the region padded by the radius is processed. Any boundary within r of
+        a region voxel lies inside that padding, so the result is identical to a
+        full-volume computation.
+
+        Returns None if the segment is empty (no boundary -> no restriction).
+        """
+        import math
+        import SimpleITK as sitk
+
+        if self._selected_segment_is_empty():
+            return None
+
+        radius_mm = float(self.ui.spinEdgeBandRadius.value)
+        spacing_ijk = self.get_volume_node().GetSpacing()  # (i, j, k)
+        pad_k = int(math.ceil(radius_mm / spacing_ijk[2])) + 1
+        pad_j = int(math.ceil(radius_mm / spacing_ijk[1])) + 1
+        pad_i = int(math.ceil(radius_mm / spacing_ijk[0])) + 1
+
+        (k0, k1), (j0, j1), (i0, i1) = region
+        padded = (
+            (max(0, k0 - pad_k), min(shape[0], k1 + pad_k)),
+            (max(0, j0 - pad_j), min(shape[1], j1 + pad_j)),
+            (max(0, i0 - pad_i), min(shape[2], i1 + pad_i)),
+        )
+        crop = self._segment_mask_in_region(segmentation_node, current_id, padded)
+
+        (pk0, _), (pj0, _), (pi0, _) = padded
+        inner = (slice(k0 - pk0, k1 - pk0), slice(j0 - pj0, j1 - pj0), slice(i0 - pi0, i1 - pi0))
+
+        if not crop.any() or crop.all():
+            # No boundary within reach of this region: nothing here is in the band.
+            return np.zeros((k1 - k0, j1 - j0, i1 - i0), dtype=bool)
+
+        image = sitk.GetImageFromArray(crop.astype(np.uint8))
+        image.SetSpacing(tuple(float(s) for s in spacing_ijk))  # sitk wants (x, y, z)
+        dist = sitk.SignedMaurerDistanceMap(
+            image, insideIsPositive=False, squaredDistance=False, useImageSpacing=True
+        )
+        band = np.abs(sitk.GetArrayFromImage(dist)) <= radius_mm
+        return band[inner]
+
+    def compute_restricted_region(self, segmentation_mask, changed_bbox,
+                                  segmentation_node, current_id, positive_click=None):
+        """
+        Apply the edit restrictions to the prediction:
+          1. Editable Area   -- voxels outside the area keep their current state.
+          2. Intensity range -- likewise for voxels whose intensity is out of range.
+          3. Edge band       -- likewise for voxels farther than the radius from
+             the current segment's boundary.
+          1-3 are intersected: a voxel must pass all active ones to change.
+          4. Directional lock -- positive prompt: add only; negative: remove only.
+        All are defined relative to the segment's state BEFORE this prompt, so
+        they compose consistently (the order of 1-3 and 4 does not matter).
+             `positive_click` is the polarity of the prompt that produced this
+             prediction; None (undo, seeding) means the lock does not apply.
+
+        Returns None when no restriction is active (caller uses the prediction
+        unchanged). Otherwise returns (region, new_region): the restricted uint8
+        values for `region` -- the changed bbox, or the whole volume if no bbox.
+        Outside the region the prediction didn't change anything, so the
+        segment's current content is kept there.
+        """
+        area_mode = self.get_editable_area_mode()
+        band_on = bool(self.ui.chkEdgeBand.checked)
+        intensity_on = bool(self.ui.chkIntensityRange.checked)
+        lock = positive_click if self.ui.chkDirectionalLock.checked else None
+        if area_mode == "everywhere" and not band_on and not intensity_on and lock is None:
+            return None  # fast exit: no overhead on the default path
+
+        shape = segmentation_mask.shape
+        if changed_bbox is not None:
+            region = tuple((int(a), int(b)) for a, b in changed_bbox)
+        else:
+            region = ((0, shape[0]), (0, shape[1]), (0, shape[2]))
+        (k0, k1), (j0, j1), (i0, i1) = region
+        if k1 <= k0 or j1 <= j0 or i1 <= i0:
+            return None
+
+        constraint = None
+        if area_mode != "everywhere":
+            constraint = self._editable_area_constraint_in_region(
+                segmentation_node, current_id, region
+            )
+        if intensity_on:
+            intensity = self._intensity_constraint_in_region(region, shape)
+            if intensity is not None:
+                constraint = intensity if constraint is None else (constraint & intensity)
+        if band_on:
+            band = self._edge_band_in_region(segmentation_node, current_id, region, shape)
+            if band is not None:
+                constraint = band if constraint is None else (constraint & band)
+        if constraint is None and lock is None:
+            return None  # nothing to restrict (e.g. no specific segment, empty segment)
+
+        predicted = segmentation_mask[k0:k1, j0:j1, i0:i1] != 0
+        previous = self._segment_mask_in_region(segmentation_node, current_id, region)
+
+        new_region = predicted
+        if constraint is not None:
+            new_region = np.where(constraint, new_region, previous)
+        if lock is True:
+            new_region = new_region | previous   # add only
+        elif lock is False:
+            new_region = new_region & previous   # remove only
+        new_region = new_region.astype(np.uint8)
+
+        debug_print(
+            f"Edit restrictions (area={area_mode}, intensity={intensity_on}, "
+            f"band={band_on}, lock={lock}): "
+            f"{int((predicted != previous).sum())} voxels would change, "
+            f"{int((new_region.astype(bool) != previous).sum())} allowed"
+        )
+        return region, new_region
+
+    ###############################################################################
+    # Modify Other Segments
+    ###############################################################################
+    #
+    # After the current segment is written, decides what happens to OTHER
+    # segments at the voxels the current segment now covers (within the region
+    # the prediction changed):
+    #   - "Allow overlap"     : nothing (default; the module's native behaviour).
+    #   - "Overwrite all"     : remove those voxels from every other segment.
+    #   - "Overwrite visible" : only from segments that are currently visible.
+    # Clears happen in place on the zero-copy internal labelmaps and only touch
+    # each segment's OWN label value, so shared labelmaps and separate layers are
+    # both preserved.
+
+    _MODIFY_OTHER_MODES = {
+        "Overwrite all": "overwrite_all",
+        "Overwrite visible": "overwrite_visible",
+        "Allow overlap": "allow_overlap",
+    }
+
+    def get_modify_other_segments_mode(self):
+        return self._MODIFY_OTHER_MODES.get(
+            self.ui.cmbModifyOtherSegments.currentText, "allow_overlap"
+        )
+
+    def _clear_segment_in_region(self, segmentation_node, segment_id, region, clear_mask):
+        """
+        Remove `segment_id` from the voxels where `clear_mask` (shaped like
+        `region`) is True. Returns the number of voxels removed.
+        """
+        (k0, k1), (j0, j1), (i0, i1) = region
+        segment = segmentation_node.GetSegmentation().GetSegment(segment_id)
+        if segment is None:
+            return 0
+        vimage = segmentation_node.GetBinaryLabelmapInternalRepresentation(segment_id)
+        if vimage is None:
+            return 0
+        label_value = segment.GetLabelValue()
+
+        if not self._labelmap_matches_volume_geometry(vimage):
+            # Slow, rare path: labelmap on a different grid than the volume.
+            volume_node = self.get_volume_node()
+            full = slicer.util.arrayFromSegmentBinaryLabelmap(
+                segmentation_node, segment_id, volume_node
+            )
+            if full is None:
+                return 0
+            hit = (full[k0:k1, j0:j1, i0:i1] != 0) & clear_mask
+            n = int(hit.sum())
+            if n:
+                full = (full != 0).astype(np.uint8)
+                full[k0:k1, j0:j1, i0:i1][hit] = 0
+                slicer.util.updateSegmentBinaryLabelmapFromArray(
+                    full, segmentation_node, segment_id, volume_node
+                )
+            return n
+
+        ix0, ix1, iy0, iy1, iz0, iz1 = vimage.GetExtent()
+        if ix1 < ix0 or iy1 < iy0 or iz1 < iz0:
+            return 0
+        ka, kb = max(k0, iz0), min(k1, iz1 + 1)
+        ja, jb = max(j0, iy0), min(j1, iy1 + 1)
+        ia, ib = max(i0, ix0), min(i1, ix1 + 1)
+        if ka >= kb or ja >= jb or ia >= ib:
+            return 0
+
+        view = slicer.util.arrayFromSegmentInternalBinaryLabelmap(segmentation_node, segment_id)
+        if view is None or view.size == 0:
+            return 0
+        sub = view[ka - iz0:kb - iz0, ja - iy0:jb - iy0, ia - ix0:ib - ix0]
+        hit = (sub == label_value) & clear_mask[ka - k0:kb - k0, ja - j0:jb - j0, ia - i0:ib - i0]
+        n = int(hit.sum())
+        if n:
+            sub[hit] = 0  # writes through to the labelmap; other values untouched
+            vimage.Modified()  # numpy write bypasses VTK's MTime
+            segment.Modified()
+        return n
+
+    def apply_modify_other_segments(self, segmentation_node, current_id, region, current_region_mask):
+        """
+        Remove the current segment's voxels (`current_region_mask`, shaped like
+        `region`) from other segments according to the selected mode.
+        """
+        mode = self.get_modify_other_segments_mode()
+        if mode == "allow_overlap":
+            return
+        if not current_region_mask.any():
+            return
+
+        display_node = segmentation_node.GetDisplayNode()
+        segmentation = segmentation_node.GetSegmentation()
+        for idx in range(segmentation.GetNumberOfSegments()):
+            segment_id = segmentation.GetNthSegmentID(idx)
+            if segment_id == current_id:
+                continue
+            if (mode == "overwrite_visible" and display_node is not None
+                    and not display_node.GetSegmentVisibility(segment_id)):
+                continue
+            removed = self._clear_segment_in_region(
+                segmentation_node, segment_id, region, current_region_mask
+            )
+            if removed:
+                debug_print(
+                    f"Modify other segments: removed {removed} voxels from "
+                    f"'{segmentation.GetSegment(segment_id).GetName()}'"
+                )
+
+    def show_segmentation(self, segmentation_mask, changed_bbox=None, restrict=True,
+                          positive_click=None):
         """
         Updates the currently selected segment with the given binary mask array.
 
@@ -3897,6 +4381,35 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         segmentationNode, selectedSegmentID = (
             self.get_selected_segmentation_node_and_segment_id()
         )
+
+        # --- Edit restrictions (Editable Area) ---
+        # Never modify segmentation_mask in place: it is the session's live target
+        # buffer. Build a separate array instead.
+        restricted = None
+        if restrict:
+            try:
+                restricted = self.compute_restricted_region(
+                    segmentation_mask, changed_bbox, segmentationNode, selectedSegmentID,
+                    positive_click=positive_click,
+                )
+            except Exception as exc:  # noqa: BLE001
+                import traceback
+                traceback.print_exc()
+                print(
+                    f"[nnInteractive] Edit restriction failed ({exc}); "
+                    "prediction NOT applied to avoid unrestricted edits."
+                )
+                return
+        if restricted is not None:
+            (rk0, rk1), (rj0, rj1), (ri0, ri1) = restricted[0]
+            if changed_bbox is not None:
+                # Only the bbox is read by the region-limited write; np.zeros is
+                # lazily allocated, so the untouched remainder costs nothing.
+                staged = np.zeros(segmentation_mask.shape, dtype=np.uint8)
+                staged[rk0:rk1, rj0:rj1, ri0:ri1] = restricted[1]
+                segmentation_mask = staged
+            else:
+                segmentation_mask = restricted[1]  # region is the whole volume
 
         was_3d_shown = segmentationNode.GetSegmentation().ContainsRepresentation(slicer.vtkSegmentationConverter.GetSegmentationClosedSurfaceRepresentationName())
 
@@ -3915,6 +4428,18 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                     debug_print(f"region-limited update failed; full update instead ({exc})")
                     updated_region = False
             if not updated_region:
+                if restricted is not None and changed_bbox is not None:
+                    # Full rewrite needed, but the staged array only holds the bbox.
+                    # Start from the segment's CURRENT content (not the session
+                    # buffer, which may hold previously suppressed voxels outside
+                    # the bbox) and paste the restricted region in.
+                    shape = segmentation_mask.shape
+                    full = self._segment_mask_in_region(
+                        segmentationNode, selectedSegmentID,
+                        ((0, shape[0]), (0, shape[1]), (0, shape[2])),
+                    ).astype(np.uint8)
+                    full[rk0:rk1, rj0:rj1, ri0:ri1] = restricted[1]
+                    segmentation_mask = full
                 slicer.util.updateSegmentBinaryLabelmapFromArray(
                     segmentation_mask,
                     segmentationNode,
@@ -3925,6 +4450,29 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 f"apply path: changed_bbox={'set' if changed_bbox is not None else 'None'}"
                 f" region_applied={updated_region} labelmap_write={time.time() - t_update:.3f}s"
             )
+
+            # --- Modify Other Segments ---
+            # Runs inside the RenderBlocker and before the 3D rebuild below, so the
+            # other segments' 3D models update in the same pass. Skipped for Reset
+            # (restrict=False), which writes an empty mask anyway.
+            if restrict and self.get_modify_other_segments_mode() != "allow_overlap":
+                try:
+                    shape = segmentation_mask.shape
+                    if changed_bbox is not None:
+                        region = tuple((int(a), int(b)) for a, b in changed_bbox)
+                    else:
+                        region = ((0, shape[0]), (0, shape[1]), (0, shape[2]))
+                    (mk0, mk1), (mj0, mj1), (mi0, mi1) = region
+                    # Read-only slice of what was just written (never mutated).
+                    current_region_mask = segmentation_mask[mk0:mk1, mj0:mj1, mi0:mi1] != 0
+                    self.apply_modify_other_segments(
+                        segmentationNode, selectedSegmentID, region, current_region_mask
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    import traceback
+                    traceback.print_exc()
+                    print(f"[nnInteractive] Modify other segments failed ({exc}).")
+
             if was_3d_shown:
                 segmentationNode.CreateClosedSurfaceRepresentation()
 
@@ -4854,7 +5402,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             self.session.add_initial_seg_interaction(seed, run_prediction=False)
         self.previous_states["segment_fp"] = self._segment_fingerprint()
 
-    def apply_result(self, changed_bbox=None):
+    def apply_result(self, changed_bbox=None, positive_click=None):
         """Render the session's target buffer into the active segment.
 
         ``changed_bbox`` is the prediction's clipped paste bbox (from the backend); when
@@ -4864,7 +5412,11 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             # No copy needed: updateSegmentBinaryLabelmapFromArray copies the data into
             # VTK, and we no longer keep a reference to the array as a baseline (we use a
             # fingerprint instead), so the session can safely reuse target_buffer.
-            self.show_segmentation(self.target_buffer, changed_bbox)
+            # positive_click: polarity of the prompt behind this result, for the
+            # directional lock. None for undo, which the lock must not block.
+            self.show_segmentation(
+                self.target_buffer, changed_bbox, positive_click=positive_click
+            )
 
     def on_undo(self):
         """Undo the most recent interaction (if the session supports it)."""

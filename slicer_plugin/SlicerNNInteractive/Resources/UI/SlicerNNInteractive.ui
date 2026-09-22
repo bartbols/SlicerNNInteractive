@@ -128,6 +128,198 @@
           </widget>
          </item>
          <item>
+          <widget class="QGroupBox" name="editableAreaGroup">
+           <property name="title">
+            <string>Editable Area:</string>
+           </property>
+           <layout class="QVBoxLayout" name="verticalLayout_editable_area">
+            <item>
+             <widget class="QComboBox" name="cmbEditableArea">
+              <property name="toolTip">
+               <string>Restrict which voxels nnInteractive's predictions are allowed to modify in the current segment. Voxels outside the area keep their current state.</string>
+              </property>
+              <item>
+               <property name="text">
+                <string>Everywhere</string>
+               </property>
+              </item>
+              <item>
+               <property name="text">
+                <string>Inside segments</string>
+               </property>
+              </item>
+              <item>
+               <property name="text">
+                <string>Outside segments</string>
+               </property>
+              </item>
+              <item>
+               <property name="text">
+                <string>Specific segment</string>
+               </property>
+              </item>
+             </widget>
+            </item>
+            <item>
+             <layout class="QHBoxLayout" name="horizontalLayout_editable_area_segment">
+              <item>
+               <widget class="QLabel" name="lblEditableAreaSegment">
+                <property name="text">
+                 <string>Segment:</string>
+                </property>
+               </widget>
+              </item>
+              <item>
+               <widget class="QComboBox" name="cmbEditableAreaSegment">
+                <property name="toolTip">
+                 <string>The existing segment whose region defines the editable area.</string>
+                </property>
+                <property name="sizePolicy">
+                 <sizepolicy hsizetype="Expanding" vsizetype="Fixed">
+                  <horstretch>1</horstretch>
+                  <verstretch>0</verstretch>
+                 </sizepolicy>
+                </property>
+               </widget>
+              </item>
+             </layout>
+            </item>
+            <item>
+             <layout class="QHBoxLayout" name="horizontalLayout_intensity">
+              <item>
+               <widget class="QCheckBox" name="chkIntensityRange">
+                <property name="text">
+                 <string>Intensity:</string>
+                </property>
+                <property name="toolTip">
+                 <string>When checked, only voxels whose image intensity lies within this range can change. Others keep their current state.</string>
+                </property>
+                <property name="checked">
+                 <bool>false</bool>
+                </property>
+               </widget>
+              </item>
+              <item>
+               <widget class="ctkRangeWidget" name="intensityRangeSlider">
+                <property name="enabled">
+                 <bool>false</bool>
+                </property>
+                <property name="sizePolicy">
+                 <sizepolicy hsizetype="Expanding" vsizetype="Fixed">
+                  <horstretch>1</horstretch>
+                  <verstretch>0</verstretch>
+                 </sizepolicy>
+                </property>
+               </widget>
+              </item>
+              <item>
+               <widget class="QToolButton" name="pbIntensityRangeReset">
+                <property name="enabled">
+                 <bool>false</bool>
+                </property>
+                <property name="text">
+                 <string>↺</string>
+                </property>
+                <property name="toolTip">
+                 <string>Reset to the full intensity range of the current volume.</string>
+                </property>
+               </widget>
+              </item>
+             </layout>
+            </item>
+            <item>
+             <layout class="QHBoxLayout" name="horizontalLayout_edge_band">
+              <item>
+               <widget class="QCheckBox" name="chkEdgeBand">
+                <property name="text">
+                 <string>Edge band, radius:</string>
+                </property>
+                <property name="toolTip">
+                 <string>When checked, only voxels within this distance (mm) of the current segment's boundary can change -- both inward and outward. Recomputed from the segment's state before each prompt.</string>
+                </property>
+                <property name="checked">
+                 <bool>false</bool>
+                </property>
+               </widget>
+              </item>
+              <item>
+               <widget class="QDoubleSpinBox" name="spinEdgeBandRadius">
+                <property name="enabled">
+                 <bool>false</bool>
+                </property>
+                <property name="minimum">
+                 <double>0.500000000000000</double>
+                </property>
+                <property name="maximum">
+                 <double>50.000000000000000</double>
+                </property>
+                <property name="singleStep">
+                 <double>0.500000000000000</double>
+                </property>
+                <property name="decimals">
+                 <number>1</number>
+                </property>
+                <property name="value">
+                 <double>5.000000000000000</double>
+                </property>
+                <property name="suffix">
+                 <string> mm</string>
+                </property>
+               </widget>
+              </item>
+             </layout>
+            </item>
+            <item>
+             <widget class="QCheckBox" name="chkDirectionalLock">
+              <property name="text">
+               <string>Directional lock (positive adds, negative removes)</string>
+              </property>
+              <property name="toolTip">
+               <string>When checked, a positive prompt can only add voxels to the current segment and a negative prompt can only remove voxels, based on the most recent prompt's polarity.</string>
+              </property>
+              <property name="checked">
+               <bool>false</bool>
+              </property>
+             </widget>
+            </item>
+           </layout>
+          </widget>
+         </item>
+         <item>
+          <widget class="QGroupBox" name="modifyOtherSegmentsGroup">
+           <property name="title">
+            <string>Modify Other Segments:</string>
+           </property>
+           <layout class="QVBoxLayout" name="verticalLayout_modify_other">
+            <item>
+             <widget class="QComboBox" name="cmbModifyOtherSegments">
+              <property name="toolTip">
+               <string>What happens to other segments where the current segment gains voxels: remove those voxels from them (overwrite), or let both keep them (allow overlap).</string>
+              </property>
+              <property name="currentIndex">
+               <number>2</number>
+              </property>
+              <item>
+               <property name="text">
+                <string>Overwrite all</string>
+               </property>
+              </item>
+              <item>
+               <property name="text">
+                <string>Overwrite visible</string>
+               </property>
+              </item>
+              <item>
+               <property name="text">
+                <string>Allow overlap</string>
+               </property>
+              </item>
+             </widget>
+            </item>
+           </layout>
+          </widget>
+         </item>
+         <item>
           <widget class="QGroupBox" name="pointPromptsGroup">
            <property name="title">
             <string>Interaction Tools:</string>
@@ -321,6 +513,11 @@
    <class>qMRMLSegmentEditorWidget</class>
    <extends>qMRMLWidget</extends>
    <header>qMRMLSegmentEditorWidget.h</header>
+  </customwidget>
+  <customwidget>
+   <class>ctkRangeWidget</class>
+   <extends>QWidget</extends>
+   <header>ctkRangeWidget.h</header>
   </customwidget>
  </customwidgets>
  <resources/>
